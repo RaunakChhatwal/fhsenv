@@ -1,13 +1,15 @@
 use std::{fs, ffi::{CString, OsStr}, path::{Path, PathBuf}};
 use anyhow::{anyhow, bail, Context, Result};
-use nix::{sched::{setns, unshare, CloneFlags}, sys::signal, unistd::{seteuid, setegid, Gid, Uid, User}};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
+use nix::{sched::{setns, unshare, CloneFlags}, sys::signal::{kill, Signal}};
+use nix::unistd::{seteuid, setegid, Gid, Uid, User};
 
 mod prepare_env;
 
 lazy_static::lazy_static! {
     static ref ROOT: &'static Path = Path::new("/");
-    static ref BIN: &'static Path = Path::new("/run/current-system/sw/bin");    // mitigates malicious $PATH
+    // hardcode paths to mitigate malicious $PATH
+    static ref BIN: &'static Path = Path::new("/run/current-system/sw/bin");
 }
 
 fn command(program: &str) -> Result<tokio::process::Command> {
@@ -19,7 +21,8 @@ fn command(program: &str) -> Result<tokio::process::Command> {
 }
 
 async fn subprocess<I: IntoIterator<Item: AsRef<OsStr>>>(program: &str, args: I) -> Result<String> {
-    let output = command(program)?.args(args).output().await.context(format!("Error running {program}."))?;
+    let output = command(program)?.args(args).output().await
+        .context(format!("Error running {program}."))?;
 
     if !output.status.success() {
         bail!("Error running {program}: {}.", String::from_utf8(output.stderr)?);
@@ -35,13 +38,14 @@ async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
     let derivation = serde_json::from_str::<serde_json::Value>(&output)?;
 
     let pattern = regex::Regex::new(r"^(.*)-shell-env$")?;
-    let fhsenv_name = &pattern.captures(derivation[&derivation_path]["name"].as_str().unwrap_or_default())
-        .ok_or(anyhow!("Couldn't parse derivation for environment name."))?[1];
+    let fhsenv_name = &pattern.captures(derivation[&derivation_path]["name"].as_str()
+        .unwrap_or_default()).ok_or(anyhow!("Couldn't parse derivation for environment name."))?[1];
 
     let serde_json::Value::Object(input_drvs) = &derivation[&derivation_path]["inputDrvs"] else {
         bail!("Couldn't parse derivation for FHS store path.");
     };
-    let pattern = regex::Regex::new(&format!(r"/nix/store/([^-]+)-{}-fhs.drv", regex::escape(fhsenv_name)))?;
+    let pattern =
+        regex::Regex::new(&format!(r"/nix/store/([^-]+)-{}-fhs.drv", regex::escape(fhsenv_name)))?;
     let fhs_drv = input_drvs.keys().filter_map(|input_drv| pattern.find(input_drv)).next()
         .ok_or(anyhow!("Expected FHS derivation in inputDrvs."))?.as_str();
 
@@ -53,7 +57,8 @@ async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
     if !status.success() || !fhs_path.exists() {
         bail!("Error building {fhs_drv}.");
     }
-    let pattern = regex::Regex::new(&format!(r"^/nix/store/([^-]+)-{}-fhs$", regex::escape(fhsenv_name)))?;
+    let pattern =
+        regex::Regex::new(&format!(r"^/nix/store/([^-]+)-{}-fhs$", regex::escape(fhsenv_name)))?;
     if pattern.find(&output).is_none() {
         bail!("Invalid output from nix-store --realise {fhs_drv}: {output}.");
     }
@@ -61,7 +66,8 @@ async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
     // toctou is mitigated by nix store being a read only filesystem
     let entries_expected = ["bin", "etc", "lib", "lib64", "sbin", "usr"];
     for entry in fhs_path.read_dir()?.collect::<Result<Vec<_>, _>>()? {
-        if !entries_expected.iter().any(|expected| Some(expected) == entry.file_name().to_str().as_ref()) {
+        let compare_file_name = |expected| Some(expected) == entry.file_name().to_str().as_ref();
+        if !entries_expected.iter().any(compare_file_name) {
             bail!("Unexpected subdirectory in {fhs_path:?}: {entry:?}.");
         }
     }
@@ -137,8 +143,8 @@ async fn set_mapping(mapping: Mapping, pid: u32, uid: u32, username: &str) -> Re
 
 // https://man7.org/linux/man-pages/man7/user_namespaces.7.html
 async fn enter_user_namespace(uid: Uid, gid: Gid) -> Result<()> {
-    let username =
-        User::from_uid(uid).unwrap_or(None).ok_or(anyhow!("Failed to get username from uid."))?.name;
+    let username = User::from_uid(uid)
+        .unwrap_or(None).ok_or(anyhow!("Failed to get username from uid."))?.name;
 
     // newuidmap and newgidmap don't work on its own user namespace
     // so create it in separate process and then enter it
@@ -155,7 +161,7 @@ async fn enter_user_namespace(uid: Uid, gid: Gid) -> Result<()> {
     let ns_fd = fs::File::open(&ns_path).context(format!("Failed to open {ns_path}."))?;
     setns(ns_fd, CloneFlags::CLONE_NEWUSER).context(format!("Couldn't enter {ns_path}."))?;
 
-    if let Err(error) = signal::kill(nix::unistd::Pid::from_raw(pid as i32), signal::Signal::SIGKILL) {
+    if let Err(error) = kill(nix::unistd::Pid::from_raw(pid as i32), Signal::SIGKILL) {
         eprintln!("Failed to kill process {pid}: {error}.");
     } else if let Err(error) = process.wait().await {
         eprintln!("Failed to wait for process {pid} to exit: {error}.");
@@ -254,16 +260,17 @@ async fn pivot_root(new_root: &Path) -> Result<()> {
 
 fn define_fhs(Mode { shell_nix, packages }: Mode) -> Result<String> {
     if packages.is_empty() {
-        let shell_nix = shell_nix.as_ref().map(PathBuf::as_path).unwrap_or(Path::new("./shell.nix"));
+        let shell_nix = shell_nix.as_ref().map(PathBuf::as_path).unwrap_or(Path::new("shell.nix"));
         if !shell_nix.exists() {
-            bail!("{:?} does not exist.", shell_nix.canonicalize()?);
+            bail!("{:?} does not exist.", shell_nix.canonicalize().unwrap_or(shell_nix.into()));
         }
 
-        return Ok(fs::read_to_string(shell_nix).context(format!("Failed to read from {shell_nix:?}."))?);
+        return Ok(fs::read_to_string(shell_nix)
+            .context(format!("Failed to read from {shell_nix:?}."))?);
     } else {
         // TODO: check how nix-shell sanitizes/validates packages input
         let packages_formatted =
-            packages.into_iter().map(|package| format!("({package})")).collect::<Vec<_>>().join("\n");
+            packages.into_iter().map(|pkg| format!("({pkg})")).collect::<Vec<_>>().join("\n");
         Ok(format!("
             {{ pkgs ? import <nixpkgs> {{}} }}:
             (pkgs.buildFHSUserEnv {{
