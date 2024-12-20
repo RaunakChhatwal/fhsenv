@@ -52,7 +52,7 @@ async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
     let serde_json::Value::Object(input_drvs) = &derivation[&derivation_path]["inputDrvs"] else {
         bail!("Couldn't parse derivation for FHS store path.");
     };
-    let pattern = format!(r"/nix/store/([^-]+)-{}-fhsenv-rootfs.drv", regex::escape(fhsenv_name));
+    let pattern = format!(r"^/nix/store/([^-]+)-{}-fhsenv-rootfs.drv", regex::escape(fhsenv_name));
     let regex = regex::Regex::new(&pattern)?;
     let fhs_drv = input_drvs.keys().filter_map(|input_drv| regex.find(input_drv)).next()
         .context("Expected FHS derivation in inputDrvs.")?.as_str();
@@ -201,9 +201,12 @@ async fn bind_entry(entry: &Path, target: &Path) -> Result<()> {
         return Ok(());              // do not overwrite existing entry
     }
 
-    let metadata = tokio::fs::metadata(entry).await
+    let metadata = tokio::fs::symlink_metadata(entry).await
         .context(format!("Failed to query {entry:?}'s metadata."))?;
-    if metadata.is_dir() {
+    if metadata.is_symlink() {
+        let source = tokio::fs::read_link(entry).await.context("Failed to read symlink source")?;
+        return tokio::fs::symlink(source, target).await.context("Failed to copy symlink");
+    } else if metadata.is_dir() {
         tokio::fs::create_dir(&target).await.context("Failed to create stub directory.")?;
     } else {
         tokio::fs::write(&target, "").await.context("Failed to create stub file.")?;
