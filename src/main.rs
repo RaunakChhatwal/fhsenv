@@ -1,7 +1,6 @@
 use std::{fs, ffi::{CString, OsStr}, path::{Path, PathBuf}};
 use anyhow::{bail, Context, Result};
-use nix::mount::{mount, umount2, MntFlags, MsFlags};
-use nix::{sched::{setns, CloneFlags}, sys::signal::{kill, Signal}};
+use nix::{mount::{mount, MsFlags}, sched::{setns, CloneFlags}, sys::signal::{kill, Signal}};
 use nix::unistd::{seteuid, setegid, Gid, Uid, User};
 
 mod prepare_env;
@@ -16,10 +15,6 @@ lazy_static::lazy_static! {
 }
 
 fn command(program: &Path) -> Result<tokio::process::Command> {
-    if Uid::effective() == nix::unistd::ROOT {
-        bail!("Attempted to run subprocess while root.");
-    }
-
     if !program.is_absolute() {
         bail!("{program:?} should be hardcoded.");
     }
@@ -212,8 +207,8 @@ async fn bind_entry(entry: &Path, target: &Path) -> Result<()> {
         tokio::fs::write(&target, "").await.context("Failed to create stub file.")?;
     }
 
-    let flags = MsFlags::MS_BIND | MsFlags::MS_REC;
-    mount(Some(entry), target, None::<&str>, flags, None::<&str>)       // mount works with files too
+    // CAUTION: mount does traverse symlinks
+    mount(Some(entry), target, None::<&str>, MsFlags::MS_BIND | MsFlags::MS_REC, None::<&str>)
         .context(format!("Failed to bind {entry:?} to {target:?}."))
 }
 
@@ -248,19 +243,24 @@ async fn create_new_root(fhs_path: &Path) -> Result<PathBuf> {
     bind_entries(&root.join("etc"), &new_root.join("etc"), &["ld.so.conf"]).await?;
     bind_entries(&fhs_path.join("etc"), &new_root.join("etc"), &[]).await?;
 
-    // /tmp isn't mounted to new_root/tmp because new_root is inside /tmp causing pivot_root later to fail
-    // instead we later just mount /tmp's contents
+    // /tmp isn't mounted to new_root/tmp
+    // because new_root itself is inside /tmp
+    // causing pivot_root later to fail
+    // instead we later mount /tmp after pivot_root
     bind_entries(&root, &new_root, &["etc", "tmp"]).await?;
 
     Ok(new_root)
 }
 
 async fn pivot_root(new_root: &Path) -> Result<()> {
-    let put_old = new_root.join(tempfile::TempDir::new()?.into_path().strip_prefix("/")?);
+    let old_root = tempfile::TempDir::new()?.into_path();
+
+    // create put_old
+    let put_old = new_root.join(old_root.strip_prefix("/")?);
     fs::create_dir(new_root.join("tmp")).context("Failed to create tmp in new root")?;
     fs::set_permissions(new_root.join("tmp"), std::os::unix::fs::PermissionsExt::from_mode(0o777))
         .context("Failed to set permissions on tmp")?;
-    bind_entries(&root.join("tmp"), &new_root.join("tmp"), &[]).await?;
+    fs::create_dir_all(&put_old).context("Failed to create stub directory for put_old")?;
 
     let cwd = std::env::current_dir();          // cwd before pivot_root
     nix::unistd::pivot_root(new_root, &put_old)?;
@@ -270,9 +270,10 @@ async fn pivot_root(new_root: &Path) -> Result<()> {
         }
     }
 
-    // discard old root
-    umount2(&root.join(put_old.strip_prefix(new_root)?), MntFlags::MNT_DETACH)
-        .context("Unable to unmount old root.").map_err(Into::into)
+    // mount old tmp to /tmp and thereby shadow old_root
+    let flags = MsFlags::MS_BIND | MsFlags::MS_REC;
+    mount(Some(&old_root.join("tmp")), "/tmp", None::<&str>, flags, None::<&str>)
+        .context("Failed to mount old tmp to /tmp.")
 }
 
 fn define_fhs(Mode { shell_nix, packages }: Mode) -> Result<String> {
