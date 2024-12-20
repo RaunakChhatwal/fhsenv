@@ -1,31 +1,39 @@
 use std::{fs, ffi::{CString, OsStr}, path::{Path, PathBuf}};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
-use nix::{sched::{setns, unshare, CloneFlags}, sys::signal::{kill, Signal}};
+use nix::{sched::{setns, CloneFlags}, sys::signal::{kill, Signal}};
 use nix::unistd::{seteuid, setegid, Gid, Uid, User};
 
 mod prepare_env;
 
 lazy_static::lazy_static! {
-    static ref ROOT: &'static Path = Path::new("/");
+    static ref root: &'static Path = Path::new("/");
     // hardcode paths to mitigate malicious $PATH
-    static ref BIN: &'static Path = Path::new("/run/current-system/sw/bin");
+    static ref nix_cli: PathBuf = Path::new(env!("nix")).join("bin/nix");
+    static ref nix_instantiate: PathBuf = Path::new(env!("nix")).join("bin/nix-instantiate");
+    static ref nix_store: PathBuf = Path::new(env!("nix")).join("bin/nix-store");
+    static ref unshare: PathBuf = Path::new(env!("util-linux")).join("bin/unshare");
 }
 
-fn command(program: &str) -> Result<tokio::process::Command> {
+fn command(program: &Path) -> Result<tokio::process::Command> {
     if Uid::effective() == nix::unistd::ROOT {
         bail!("Attempted to run subprocess while root.");
     }
 
-    Ok(tokio::process::Command::new(BIN.join(program)))
+    if !program.is_absolute() {
+        bail!("{program:?} should be hardcoded.");
+    }
+
+    Ok(tokio::process::Command::new(program))
 }
 
-async fn subprocess<I: IntoIterator<Item: AsRef<OsStr>>>(program: &str, args: I) -> Result<String> {
+async fn subprocess<I: IntoIterator<Item: AsRef<OsStr>>>(program: &Path, args: I)
+-> Result<String> {
     let output = command(program)?.args(args).output().await
-        .context(format!("Error running {program}."))?;
+        .context(format!("Error running {program:?}."))?;
 
     if !output.status.success() {
-        bail!("Error running {program}: {}.", String::from_utf8(output.stderr)?);
+        bail!("Error running {program:?}: {}.", String::from_utf8(output.stderr)?);
     }
 
     Ok(String::from_utf8(output.stdout)?.trim().into())
@@ -33,38 +41,38 @@ async fn subprocess<I: IntoIterator<Item: AsRef<OsStr>>>(program: &str, args: I)
 
 // TODO: handle the case where fhs_derivation doesn't actually evaluate to buildFHSUserEnv.env
 async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
-    let derivation_path = subprocess("nix-instantiate", ["-E", &fhs_definition]).await?;
-    let output = subprocess("nix", ["derivation", "show", &derivation_path]).await?;
+    let derivation_path = subprocess(&nix_instantiate, ["-E", &fhs_definition]).await?;
+    let output = subprocess(&nix_cli, ["derivation", "show", &derivation_path]).await?;
     let derivation = serde_json::from_str::<serde_json::Value>(&output)?;
 
-    let pattern = regex::Regex::new(r"^(.*)-shell-env$")?;
-    let fhsenv_name = &pattern.captures(derivation[&derivation_path]["name"].as_str()
-        .unwrap_or_default()).ok_or(anyhow!("Couldn't parse derivation for environment name."))?[1];
+    let regex = regex::Regex::new(r"^(.*)-shell-env$")?;
+    let fhsenv_name = &regex.captures(derivation[&derivation_path]["name"].as_str()
+        .unwrap_or_default()).context("Couldn't parse derivation for environment name.")?[1];
 
     let serde_json::Value::Object(input_drvs) = &derivation[&derivation_path]["inputDrvs"] else {
         bail!("Couldn't parse derivation for FHS store path.");
     };
-    let pattern =
-        regex::Regex::new(&format!(r"/nix/store/([^-]+)-{}-fhs.drv", regex::escape(fhsenv_name)))?;
-    let fhs_drv = input_drvs.keys().filter_map(|input_drv| pattern.find(input_drv)).next()
-        .ok_or(anyhow!("Expected FHS derivation in inputDrvs."))?.as_str();
+    let pattern = format!(r"/nix/store/([^-]+)-{}-fhsenv-rootfs.drv", regex::escape(fhsenv_name));
+    let regex = regex::Regex::new(&pattern)?;
+    let fhs_drv = input_drvs.keys().filter_map(|input_drv| regex.find(input_drv)).next()
+        .context("Expected FHS derivation in inputDrvs.")?.as_str();
 
     // like subprocess but without piping stderr
-    let output = command("nix-store")?.args(["--realise", fhs_drv])
+    let output = command(&nix_store)?.args(["--realise", fhs_drv])
         .stdout(std::process::Stdio::piped()).spawn()?.wait_with_output().await?;
     let (output, status) = (std::str::from_utf8(&output.stdout)?.trim(), output.status);
     let fhs_path = Path::new(output);
     if !status.success() || !fhs_path.exists() {
         bail!("Error building {fhs_drv}.");
     }
-    let pattern =
-        regex::Regex::new(&format!(r"^/nix/store/([^-]+)-{}-fhs$", regex::escape(fhsenv_name)))?;
-    if pattern.find(&output).is_none() {
+    let pattern = format!(r"^/nix/store/([^-]+)-{}-fhsenv-rootfs$", regex::escape(fhsenv_name));
+    let regex = regex::Regex::new(&pattern)?;
+    if regex.find(&output).is_none() {
         bail!("Invalid output from nix-store --realise {fhs_drv}: {output}.");
     }
 
     // toctou is mitigated by nix store being a read only filesystem
-    let entries_expected = ["bin", "etc", "lib", "lib64", "sbin", "usr"];
+    let entries_expected = ["bin", "etc", "lib", "lib32", "lib64", "sbin", "usr"];
     for entry in fhs_path.read_dir()?.collect::<Result<Vec<_>, _>>()? {
         let compare_file_name = |expected| Some(expected) == entry.file_name().to_str().as_ref();
         if !entries_expected.iter().any(compare_file_name) {
@@ -77,6 +85,13 @@ async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
 
 #[derive(Clone, Copy)]
 enum Mapping { Uid, Gid }
+
+impl Mapping {
+    fn mapper(&self) -> PathBuf {
+        let basename = match self { Mapping::Uid => "newuidmap", Mapping::Gid => "newgidmap" };
+        Path::new("/run/wrappers/bin/").join(basename)
+    }
+}
 
 fn read_subuid(mapping: Mapping, username: &str) -> Result<Vec<(u32, u32)>> {
     let path = match mapping { Mapping::Uid => "/etc/subuid", Mapping::Gid => "/etc/subgid" };
@@ -136,21 +151,20 @@ async fn set_mapping(mapping: Mapping, pid: u32, uid: u32, username: &str) -> Re
         args.extend([uid, uid, 1]);
     }
 
-    let mapper = "/run/wrappers/bin/".to_string() +
-        match mapping { Mapping::Uid => "newuidmap", Mapping::Gid => "newgidmap" };
-    subprocess(&mapper, args.iter().map(u32::to_string).into_iter()).await
+    // let mapper = mapping.mapper());
+    subprocess(&mapping.mapper(), args.iter().map(u32::to_string).into_iter()).await
 }
 
 // https://man7.org/linux/man-pages/man7/user_namespaces.7.html
 async fn enter_user_namespace(uid: Uid, gid: Gid) -> Result<()> {
     let username = User::from_uid(uid)
-        .unwrap_or(None).ok_or(anyhow!("Failed to get username from uid."))?.name;
+        .unwrap_or(None).context("Failed to get username from uid.")?.name;
 
     // newuidmap and newgidmap don't work on its own user namespace
     // so create it in separate process and then enter it
-    let mut process = command("unshare")?.args(&["-U", "sleep", "infinity"]).spawn()
+    let mut process = command(&unshare)?.args(&["-U", "sleep", "infinity"]).spawn()
         .context("Couldn't create namespace.")?;
-    let pid = process.id().ok_or(anyhow!("Namespace parent exited prematurely."))?;
+    let pid = process.id().context("Namespace parent exited prematurely.")?;
 
     set_mapping(Mapping::Uid, pid, uid.into(), &username).await.context("Failed to map uid.")?;
     fs::write(format!("/proc/{pid}/setgroups"), "deny").context("Couldn't disable setgroups.")?;
@@ -204,11 +218,11 @@ async fn bind_entry(entry: &Path, target: &Path) -> Result<()> {
 async fn bind_entries(parent: &Path, target: &Path, exclusions: &[&str]) -> Result<Vec<()>> {
     futures::future::try_join_all(parent.read_dir()?.map(|result| async move {
         let entry = result?;
-        if exclusions.into_iter().any(|exclusion| entry.file_name().to_str() == Some(exclusion)) {
-            Ok(())
-        } else {
-            bind_entry(&entry.path(), &target.join(entry.file_name())).await
+        if !exclusions.into_iter().any(|exclusion| entry.file_name().to_str() == Some(exclusion)) {
+            bind_entry(&entry.path(), &target.join(entry.file_name())).await?;
         }
+
+        Ok(())
     })).await
 }
 
@@ -228,12 +242,12 @@ async fn create_new_root(fhs_path: &Path) -> Result<PathBuf> {
 
     fs::create_dir(new_root.join("etc")).context("Failed to create etc in new_root")?;
     prepare_env::create_ld_so_conf(&new_root)?;
-    bind_entries(&ROOT.join("etc"), &new_root.join("etc"), &["ld.so.conf"]).await?;
+    bind_entries(&root.join("etc"), &new_root.join("etc"), &["ld.so.conf"]).await?;
     bind_entries(&fhs_path.join("etc"), &new_root.join("etc"), &[]).await?;
 
     // /tmp isn't mounted to new_root/tmp because new_root is inside /tmp causing pivot_root later to fail
     // instead we later just mount /tmp's contents
-    bind_entries(&ROOT, &new_root, &["etc", "tmp"]).await?;
+    bind_entries(&root, &new_root, &["etc", "tmp"]).await?;
 
     Ok(new_root)
 }
@@ -243,7 +257,7 @@ async fn pivot_root(new_root: &Path) -> Result<()> {
     fs::create_dir(new_root.join("tmp")).context("Failed to create tmp in new root")?;
     fs::set_permissions(new_root.join("tmp"), std::os::unix::fs::PermissionsExt::from_mode(0o777))
         .context("Failed to set permissions on tmp")?;
-    bind_entries(&ROOT.join("tmp"), &new_root.join("tmp"), &[]).await?;
+    bind_entries(&root.join("tmp"), &new_root.join("tmp"), &[]).await?;
 
     let cwd = std::env::current_dir();          // cwd before pivot_root
     nix::unistd::pivot_root(new_root, &put_old)?;
@@ -254,7 +268,7 @@ async fn pivot_root(new_root: &Path) -> Result<()> {
     }
 
     // discard old root
-    umount2(&ROOT.join(put_old.strip_prefix(new_root)?), MntFlags::MNT_DETACH)
+    umount2(&root.join(put_old.strip_prefix(new_root)?), MntFlags::MNT_DETACH)
         .context("Unable to unmount old root.").map_err(Into::into)
 }
 
@@ -304,7 +318,7 @@ struct Cli {
     mode: Mode,
 
     #[arg(long)]
-    run: Option<String>,
+    run: Option<String>
 }
 
 #[derive(clap::Args)]
@@ -338,7 +352,7 @@ async fn main() -> Result<()> {
         setegid(0.into()).context("Failed to set effective group ID to root")?;
     }
     // https://unix.stackexchange.com/questions/476847/
-    unshare(CloneFlags::CLONE_NEWNS).context("Couldn't create mount namespace.")?;
+    nix::sched::unshare(CloneFlags::CLONE_NEWNS).context("Couldn't create mount namespace.")?;
     let new_root = create_new_root(&fhs_path).await.context("Couldn't create new_root")?;
     pivot_root(&new_root).await.context(format!("Couldn't pivot root to {new_root:?}."))?;
 
