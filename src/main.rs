@@ -1,4 +1,4 @@
-use std::{fs, ffi::{CString, OsStr}, path::{Path, PathBuf}};
+use std::{ffi::{CString, OsStr}, fs, os::unix::fs::MetadataExt, path::{Path, PathBuf}};
 use anyhow::{bail, Context, Result};
 use nix::{mount::{mount, MsFlags}, sched::{setns, CloneFlags}, sys::signal::{kill, Signal}};
 use nix::unistd::{seteuid, setegid, Gid, Uid, User};
@@ -67,7 +67,7 @@ async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
     }
 
     // toctou is mitigated by nix store being a read only filesystem
-    let entries_expected = ["bin", "etc", "lib", "lib32", "lib64", "sbin", "usr"];
+    let entries_expected = ["bin", "etc", "lib", "lib32", "lib64", "libexec", "sbin", "usr"];
     for entry in fhs_path.read_dir()?.collect::<Result<Vec<_>, _>>()? {
         let compare_file_name = |expected| Some(expected) == entry.file_name().to_str().as_ref();
         if !entries_expected.iter().any(compare_file_name) {
@@ -214,6 +214,16 @@ async fn bind_entry(entry: &Path, target: &Path) -> Result<()> {
 
 // asynchronously loop over bind_entry
 async fn bind_entries(parent: &Path, target: &Path, exclusions: &[&str]) -> Result<Vec<()>> {
+    if !parent.starts_with("/nix/store/") {
+        let metadata = tokio::fs::symlink_metadata(parent).await
+            .context(format!("Failed to query {parent:?}'s metadata."))?;
+        // protect the checks in bind_entry from TOCTOU race conditions
+        // by ensuring parent is owned by root and doesn't provide write access to others
+        if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            bail!("{parent:?} has loose write access.");
+        }
+    }
+
     futures::future::try_join_all(parent.read_dir()?.map(|result| async move {
         let entry = result?;
         if !exclusions.into_iter().any(|exclusion| entry.file_name().to_str() == Some(exclusion)) {
