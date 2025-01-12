@@ -1,7 +1,7 @@
 use std::{ffi::{CString, OsStr}, fs, os::unix::fs::MetadataExt, path::{Path, PathBuf}};
 use anyhow::{bail, Context, Result};
 use nix::{mount::{mount, MsFlags}, sched::{setns, CloneFlags}, sys::signal::{kill, Signal}};
-use nix::unistd::{seteuid, setegid, Gid, Uid, User};
+use nix::unistd::{setegid, seteuid, setresgid, setresuid, Gid, Uid, User};
 
 mod prepare_env;
 
@@ -370,9 +370,9 @@ async fn main() -> Result<()> {
     let new_root = create_new_root(&fhs_path).await.context("Couldn't create new_root")?;
     pivot_root(&new_root).await.context(format!("Couldn't pivot root to {new_root:?}."))?;
 
-    // drop privileges again
-    seteuid(uid)?;
-    setegid(gid)?;
+    // drop privileges using setresuid to make it permanent
+    setresuid(uid, uid, uid)?;
+    setresgid(gid, gid, gid)?;
 
     prepare_env::prepare_env();
     enter_shell(cli.run)
